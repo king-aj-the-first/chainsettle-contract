@@ -1,6 +1,14 @@
 //! Storage abstraction layer for the ChainSettle contract.
-//!.
-        };
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::{
+        ChainSettleContract, ChainSettleContractClient, Milestone, MilestoneMode, MilestoneStatus,
+        Resolution, ShipmentOptions,
+    };
         use proptest::prelude::*;
         use soroban_sdk::{testutils::Address as _, token, vec, Address, BytesN, Env, String};
 
@@ -185,7 +193,6 @@
             }
         }
     }
-}
 
 use soroban_sdk::{contracttype, Address, Env, String, Vec};
 

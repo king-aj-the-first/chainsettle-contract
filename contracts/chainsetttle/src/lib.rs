@@ -603,6 +603,17 @@ pub struct ReputationFastTrack {
     pub max_disputed_ratio_bps: u32,
 }
 
+/// #631 – Per-supplier on-time vs late confirmed-milestone counters.
+/// Incremented when a milestone with a deadline is confirmed: `on_time` when
+/// the proof was submitted on or before the deadline, `late` otherwise.
+/// Milestones without a deadline never increment either counter.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SupplierTimeliness {
+    pub on_time: u32,
+    pub late: u32,
+}
+
 /// Pending mutual-consent pause or resume request for a single shipment.
 /// Pending mutual-consent pause or resume request for a single shipment.
 #[contracttype]
@@ -1730,6 +1741,10 @@ pub enum DataKeyExt4 {
     // ── Encrypted evidence key envelopes for arbiters ─────────────────────
     /// Encrypted evidence key envelope for a dispute on (shipment_id, milestone_index).
     DisputeEvidenceEnvelope(String, u32),
+
+    // ── #631 Supplier on-time milestone rate ─────────────────────────────────
+    /// Per-supplier timeliness counters: (on_time, late).
+    SupplierTimeliness(Address),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -3154,6 +3169,16 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .get(&DataKey::SupplierRep(supplier.clone()))
+            .unwrap_or_default()
+    }
+
+    /// #631 – Returns the supplier's on-time vs late confirmed-milestone
+    /// counters. Milestones without a deadline never increment either counter,
+    /// so a new supplier starts at (0, 0).
+    pub fn get_supplier_timeliness(env: Env, supplier: Address) -> SupplierTimeliness {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::SupplierTimeliness(supplier))
             .unwrap_or_default()
     }
 
@@ -10528,6 +10553,8 @@ impl ChainSettleContract {
             milestone.release_after_ledger = env.ledger().sequence() + shipment.holdback_ledgers;
             milestone.status = MilestoneStatus::ConfirmedHeld;
             shipment.milestones.set(milestone_index, milestone.clone());
+            // #631: Count this confirmation toward the supplier timeliness rate.
+            Self::record_milestone_timeliness(&env, &shipment.supplier, &milestone);
 
             // Pay early bonus immediately even for held milestones (bonus is based on delivery time).
             let mut early_bonus_paid: i128 = 0;
@@ -10643,6 +10670,8 @@ impl ChainSettleContract {
 
             shipment.milestones.set(milestone_index, milestone);
             shipment.released_amount += payment;
+            // #631: Count this confirmation toward the supplier timeliness rate.
+            Self::record_milestone_timeliness(&env, &shipment.supplier, &shipment.milestones.get(milestone_index).unwrap());
             // #162: Track last confirmed milestone for sequential enforcement queries.
             shipment.last_confirmed_milestone_index = Some(milestone_index);
             // #475: Release this milestone's collateral share if opted in.
@@ -11140,6 +11169,8 @@ impl ChainSettleContract {
             let mut milestone = shipment.milestones.get(idx).unwrap();
             milestone.status = MilestoneStatus::Confirmed;
             shipment.milestones.set(idx, milestone.clone());
+            // #631: Count this confirmation toward the supplier timeliness rate.
+            Self::record_milestone_timeliness(&env, &shipment.supplier, &milestone);
             // #162: Track last confirmed milestone.
             shipment.last_confirmed_milestone_index = Some(idx);
             // #475: Release this milestone's collateral share if opted in.
@@ -14144,6 +14175,8 @@ impl ChainSettleContract {
 
         let milestone_deadline = milestone.deadline_ledger;
         milestone.status = MilestoneStatus::Confirmed;
+        // #631: Count this auto-confirmation toward the supplier timeliness rate.
+        Self::record_milestone_timeliness(&env, &shipment.supplier, &milestone);
 
         Self::append_audit_entry(
             &env,
@@ -19724,6 +19757,42 @@ impl ChainSettleContract {
         }
     }
 
+    /// #631 – Records one confirmed milestone for the supplier's timeliness
+    /// counters. No-ops for milestones without a deadline. Callers must have
+    /// already authenticated the confirming party and appended the
+    /// `milestone_confirmed` audit entry; this helper extends the counter TTL
+    /// and emits a `timeliness_recorded` event.
+    fn record_milestone_timeliness(env: &Env, supplier: &Address, milestone: &Milestone) {
+        if milestone.deadline_ledger == 0 {
+            return;
+        }
+        let proof_ledger = milestone.proof_submitted_ledger.unwrap_or(0);
+        if proof_ledger == 0 {
+            return;
+        }
+        let key = DataKeyExt4::SupplierTimeliness(supplier.clone());
+        let mut timeliness: SupplierTimeliness =
+            env.storage().persistent().get(&key).unwrap_or_default();
+        if proof_ledger <= milestone.deadline_ledger {
+            timeliness.on_time = timeliness.on_time.saturating_add(1);
+        } else {
+            timeliness.late = timeliness.late.saturating_add(1);
+        }
+        env.storage().persistent().set(&key, &timeliness);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (
+                Symbol::new(env, "timeliness_recorded"),
+                supplier.clone(),
+            ),
+            (timeliness.on_time, timeliness.late),
+        );
+    }
+
     /// Update buyer reliability score on milestone confirmation.
     fn update_buyer_reliability_on_confirmation(
         env: &Env,
@@ -22112,6 +22181,12 @@ impl ChainSettleContract {
         milestone.status = MilestoneStatus::ConfirmedHeld;
         milestone.release_after_ledger = release_after;
         shipment.milestones.set(milestone_index, milestone);
+        // #631: Count this graded confirmation toward the supplier timeliness rate.
+        Self::record_milestone_timeliness(
+            &env,
+            &shipment.supplier,
+            &shipment.milestones.get(milestone_index).unwrap(),
+        );
 
         env.storage().persistent().set(
             &DataKeyExt3::PendingGrade(shipment_id.clone(), milestone_index),
@@ -23942,6 +24017,7 @@ mod test_granular_roles;
 mod test_metadata_index;
 mod test_role_expiry;
 mod test_new_milestone;
+mod test_supplier_timeliness;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
