@@ -1742,9 +1742,12 @@ pub enum DataKeyExt4 {
     /// Encrypted evidence key envelope for a dispute on (shipment_id, milestone_index).
     DisputeEvidenceEnvelope(String, u32),
 
-    // ── #631 Supplier on-time milestone rate ─────────────────────────────────
-    /// Per-supplier timeliness counters: (on_time, late).
-    SupplierTimeliness(Address),
+    // ── #617 Global document-hash uniqueness registry ──────────────────────
+    /// Owner shipment of a registered bill-of-lading or invoice hash.
+    /// Present means the hash is tied to a live shipment and cannot be reused.
+    DocHashOwner(BytesN<32>),
+    /// Bill-of-lading hash attached to (shipment_id, milestone_index).
+    ShipmentBolHash(String, u32),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -6373,7 +6376,9 @@ impl ChainSettleContract {
     // ----------------------------------------------------------
 
     /// Supplier attaches an invoice hash to a milestone at or after proof submission.
-    /// Immutable once set — subsequent calls panic.
+    /// Immutable once set — subsequent calls panic. The hash is registered in
+    /// the global document-hash registry (#617) and panics with
+    /// `"document hash already used"` if another active shipment owns it.
     pub fn attach_invoice_hash(
         env: Env,
         caller: Address,
@@ -6382,7 +6387,8 @@ impl ChainSettleContract {
         invoice_hash: BytesN<32>,
     ) {
         Self::assert_not_paused(&env);
-        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        caller.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
         }
@@ -6398,9 +6404,25 @@ impl ChainSettleContract {
         if m.status == MilestoneStatus::Pending {
             panic!("proof must be submitted before attaching invoice hash");
         }
+        Self::register_doc_hash(&env, &invoice_hash, &shipment_id);
         env.storage().persistent().set(&key, &invoice_hash);
         env.storage().persistent().extend_ttl(
             &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "invoice_hash_attached"),
+            Symbol::new(&env, "attach_invoice_hash"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Shipment(shipment_id.clone()),
             constants::TTL_INITIAL_LEDGERS,
             constants::TTL_MAX_LEDGERS,
         );
@@ -6422,6 +6444,139 @@ impl ChainSettleContract {
                 shipment_id,
                 milestone_index,
             ))
+    }
+
+    // ----------------------------------------------------------
+    // #617 – BILL-OF-LADING HASH + GLOBAL UNIQUENESS REGISTRY
+    // ----------------------------------------------------------
+
+    /// Asserts `doc_hash` is not owned by another shipment. Panics with
+    /// `"document hash already used"` when it is registered elsewhere.
+    /// Re-attaching the owning shipment's own hash is allowed.
+    fn assert_doc_hash_unused(env: &Env, doc_hash: &BytesN<32>, shipment_id: &String) {
+        let owner_key = DataKeyExt4::DocHashOwner(doc_hash.clone());
+        if let Some(owner) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt4, String>(&owner_key)
+        {
+            if owner != *shipment_id {
+                panic!("document hash already used");
+            }
+        }
+    }
+
+    /// Records `doc_hash` as owned by `shipment_id` (idempotent for the same
+    /// owner) and tops up the registry entry TTL.
+    fn register_doc_hash(env: &Env, doc_hash: &BytesN<32>, shipment_id: &String) {
+        Self::assert_doc_hash_unused(env, doc_hash, shipment_id);
+        let owner_key = DataKeyExt4::DocHashOwner(doc_hash.clone());
+        env.storage()
+            .persistent()
+            .set(&owner_key, shipment_id);
+        env.storage().persistent().extend_ttl(
+            &owner_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    /// Releases every invoice and bill-of-lading hash registered by
+    /// `shipment_id` so the documents become reusable. Called when a shipment
+    /// is cancelled or archived.
+    fn release_shipment_doc_hashes(env: &Env, shipment_id: &String, milestone_count: u32) {
+        for i in 0..milestone_count {
+            if let Some(h) = env.storage().persistent().get::<DataKeyExt, BytesN<32>>(
+                &DataKeyExt::MilestoneInvoiceHash(shipment_id.clone(), i),
+            ) {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKeyExt4::DocHashOwner(h));
+            }
+            if let Some(h) = env.storage().persistent().get::<DataKeyExt4, BytesN<32>>(
+                &DataKeyExt4::ShipmentBolHash(shipment_id.clone(), i),
+            ) {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKeyExt4::DocHashOwner(h));
+            }
+        }
+    }
+
+    /// Supplier attaches a bill-of-lading hash to a milestone at or after
+    /// proof submission. Immutable once set — subsequent calls panic. The hash
+    /// is registered in the global document-hash registry and panics with
+    /// `"document hash already used"` if another active shipment owns it.
+    pub fn attach_bol_hash(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        bol_hash: BytesN<32>,
+    ) {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::require_supplier_auth(&shipment, &caller);
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+        let key = DataKeyExt4::ShipmentBolHash(shipment_id.clone(), milestone_index);
+        if env.storage().persistent().has(&key) {
+            panic!("bol hash already set and is immutable");
+        }
+        let m = shipment.milestones.get(milestone_index).unwrap();
+        if m.status == MilestoneStatus::Pending {
+            panic!("proof must be submitted before attaching bol hash");
+        }
+        Self::register_doc_hash(&env, &bol_hash, &shipment_id);
+        env.storage().persistent().set(&key, &bol_hash);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "bol_hash_attached"),
+            Symbol::new(&env, "attach_bol_hash"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Shipment(shipment_id.clone()),
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "bol_hash_attached"), shipment_id),
+            (milestone_index, bol_hash, caller),
+        );
+    }
+
+    /// Returns the bill-of-lading hash for a milestone, or None if not set.
+    pub fn get_bol_hash(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::ShipmentBolHash(shipment_id, milestone_index))
+    }
+
+    /// Returns the shipment ID that currently owns `doc_hash` (invoice or
+    /// bill-of-lading), or None if the hash is free to use.
+    pub fn get_document_hash_owner(env: Env, doc_hash: BytesN<32>) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::DocHashOwner(doc_hash))
     }
 
     // ----------------------------------------------------------
@@ -13464,6 +13619,9 @@ impl ChainSettleContract {
         let milestone_count = shipment.milestones.len();
         storage::prune_shipment_auxiliary_keys(env, shipment_id, milestone_count);
 
+        // #617: release document hashes so the trade documents become reusable.
+        Self::release_shipment_doc_hashes(env, shipment_id, milestone_count);
+
         env.events().publish(
             (Symbol::new(env, "shipment_cancelled"), shipment_id.clone()),
             (refund, cancel_fee, buyer.clone(), env.ledger().sequence()),
@@ -13625,6 +13783,8 @@ impl ChainSettleContract {
             refund,
             CancellationReason::SupplierCancelled,
         );
+        // #617: release document hashes so the trade documents become reusable.
+        Self::release_shipment_doc_hashes(&env, &shipment_id, shipment.milestones.len());
     }
 
     // ----------------------------------------------------------
@@ -18451,6 +18611,8 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .remove(&DataKey::CancelPolicy(shipment_id.clone()));
+        // #617: release document hashes so the trade documents become reusable.
+        Self::release_shipment_doc_hashes(&env, &shipment_id, shipment.milestones.len());
         env.events().publish(
             (Symbol::new(&env, "shipment_archived"), shipment_id),
             (archived.status, archived.completed_at),
@@ -23485,6 +23647,20 @@ impl ChainSettleContract {
             bump_key!(DataKeyExt4::DisputeSplitBps(shipment_id.clone(), i));
             bump_key!(DataKeyExt4::PendingSplit(shipment_id.clone(), i));
             bump_key!(DataKeyExt4::PanelEscalated(shipment_id.clone(), i));
+            bump_key!(DataKeyExt4::ShipmentBolHash(shipment_id.clone(), i));
+
+            // #617: keep the uniqueness-registry owners for this milestone's
+            // documents alive alongside the shipment.
+            if let Some(h) = env.storage().persistent().get::<DataKeyExt, BytesN<32>>(
+                &DataKeyExt::MilestoneInvoiceHash(shipment_id.clone(), i),
+            ) {
+                bump_key!(DataKeyExt4::DocHashOwner(h));
+            }
+            if let Some(h) = env.storage().persistent().get::<DataKeyExt4, BytesN<32>>(
+                &DataKeyExt4::ShipmentBolHash(shipment_id.clone(), i),
+            ) {
+                bump_key!(DataKeyExt4::DocHashOwner(h));
+            }
 
             if let Some(ref purpose) = oracle_purpose {
                 bump_key!(DataKeyExt3::OracleAttestations(
@@ -23977,6 +24153,7 @@ mod test_top_up_escrow;
 // mod test_upgrade;
 mod test_buyer_spending_limit;
 mod test_dispute_mediator;
+mod test_doc_hash_registry;
 mod test_emergency_freeze;
 mod test_event_schema;
 mod test_fee_tier_recalc;
